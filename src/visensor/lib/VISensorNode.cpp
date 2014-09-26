@@ -21,10 +21,11 @@
 #include <diagnostic_updater/publisher.h>
 
 #include <boost/shared_ptr.hpp>
-
-#include <ros/rate.h>
+#include <boost/make_shared.hpp>
 
 #include <sensor_msgs/Imu.h>
+
+#include <visensor/visensor.hpp>
 
 namespace visensor {
 
@@ -35,439 +36,135 @@ namespace visensor {
   VISensorNode::VISensorNode(const ros::NodeHandle& nh) :
       _nodeHandle(nh) {
     getParameters();
-    if (_spinRate < (int)Controller::mMinRPM) {
-      _spinRate = Controller::mMinRPM;
-      ROS_WARN_STREAM("VISensorNode::VISensorNode(): the RPMs must lie in "
-        "the range [" << Controller::mMinRPM << ", "
-        << Controller::mMaxRPM << "]");
-    }
-    else if (_spinRate > (int)Controller::mMaxRPM) {
-      _spinRate = Controller::mMaxRPM;
-      ROS_WARN_STREAM("VISensorNode::VISensorNode(): the RPMs must lie in "
-        "the range [" << Controller::mMinRPM << ", "
-        << Controller::mMaxRPM << "]");
-    }
-    _pointCloudPublisher =
-      _nodeHandle.advertise<sensor_msgs::PointCloud>("point_cloud",
-      _queueDepth);
-    _dataPacketPublisher =
-      _nodeHandle.advertise<velodyne::DataPacketMsg>("data_packet",
-      _queueDepth);
-    _binarySnappyPublisher =
-      _nodeHandle.advertise<velodyne::BinarySnappyMsg>("binary_snappy",
-        _queueDepth);
-    if (_deviceName == "Velodyne HDL-32E") {
-      _imuPublisher = _nodeHandle.advertise<sensor_msgs::Imu>("imu",
-        _queueDepth);
-      _tempPublisher = _nodeHandle.advertise<velodyne::TemperatureMsg>(
-        "temperature", _queueDepth);
-    }
-    if (_deviceName == "Velodyne HDL-64E S2")
-      _setRPMService = _nodeHandle.advertiseService("set_rpm",
-        &VISensorNode::setRPM, this);
+    _driver = std::make_shared<ViSensorDriver>();
     _updater.setHardwareID(_deviceName);
-    _updater.add("UDP connection DP", this,
-      &VISensorNode::diagnoseUDPConnectionDP);
-    if (_deviceName == "Velodyne HDL-32E")
-      _updater.add("UDP connection PP", this,
-        &VISensorNode::diagnoseUDPConnectionPP);
-    _updater.add("Data packet queue", this,
-      &VISensorNode::diagnoseDataPacketQueue);
-    if (_deviceName == "Velodyne HDL-32E")
-      _updater.add("Position packet queue", this,
-        &VISensorNode::diagnosePositionPacketQueue);
-    if (_deviceName == "Velodyne HDL-64E S2")
-      _updater.add("Serial connection", this,
-        &VISensorNode::diagnoseSerialConnection);
     _dpFreq.reset(new diagnostic_updater::HeaderlessTopicDiagnostic(
       "data_packet", _updater,
       diagnostic_updater::FrequencyStatusParam(&_dpMinFreq, &_dpMaxFreq,
       0.1, 10)));
-    if (_deviceName == "Velodyne HDL-32E")
-      _ppFreq.reset(new diagnostic_updater::HeaderlessTopicDiagnostic(
-        "imu", _updater,
-        diagnostic_updater::FrequencyStatusParam(&_ppMinFreq, &_ppMaxFreq,
-        0.1, 10)));
     _updater.force_update();
   }
 
   VISensorNode::~VISensorNode() {
-    if (_acqThreadPP)
-      _acqThreadPP->interrupt();
-    if (_acqThreadDP)
-      _acqThreadDP->interrupt();
   }
 
 /******************************************************************************/
 /* Methods                                                                    */
 /******************************************************************************/
 
-  void VISensorNode::publishDataPacket(const ros::Time& timestamp,
-      const DataPacket& dp) {
-    if (_pointCloudPublisher.getNumSubscribers() > 0) {
-      VdynePointCloud pointCloud;
-      Converter::toPointCloud(dp, *_calibration, pointCloud, _minDistance,
-        _maxDistance);
-      sensor_msgs::PointCloudPtr rosCloud(new sensor_msgs::PointCloud);
-      rosCloud->header.stamp = timestamp;
-      rosCloud->header.frame_id = _frameId;
-      rosCloud->header.seq = _dataPacketCounter;
-      const size_t numPoints = pointCloud.getSize();
-      rosCloud->points.reserve(numPoints);
-      rosCloud->channels.resize(1);
-      rosCloud->channels[0].name = "intensity";
-      rosCloud->channels[0].values.reserve(numPoints);
-      for (auto it = pointCloud.getPointBegin(); it != pointCloud.getPointEnd();
-          ++it) {
-        geometry_msgs::Point32 rosPoint;
-        rosPoint.x = it->mX;
-        rosPoint.y = it->mY;
-        rosPoint.z = it->mZ;
-        rosCloud->points.push_back(rosPoint);
-        rosCloud->channels[0].values.push_back(it->mIntensity);
-      }
-      _pointCloudPublisher.publish(rosCloud);
+  void VISensorNode::init() {
+    try {
+      _driver->init();
     }
-    if (_dataPacketPublisher.getNumSubscribers() > 0) {
-      velodyne::DataPacketMsgPtr dataPacketMsg(new velodyne::DataPacketMsg);
-      dataPacketMsg->header.stamp = timestamp;
-      dataPacketMsg->header.frame_id = _frameId;
-      dataPacketMsg->header.seq = _dataPacketCounter;
-      for (size_t i = 0; i < DataPacket::mDataChunkNbr; ++i) {
-        const DataPacket::DataChunk& dataChunk = dp.getDataChunk(i);
-        dataPacketMsg->dataChunks[i].headerInfo = dataChunk.mHeaderInfo;
-        dataPacketMsg->dataChunks[i].rotationalInfo = dataChunk.mRotationalInfo;
-        for (size_t j = 0; j < DataPacket::DataChunk::mLasersPerPacket; ++j) {
-          dataPacketMsg->dataChunks[i].laserData[j].distance =
-            dataChunk.mLaserData[j].mDistance;
-          dataPacketMsg->dataChunks[i].laserData[j].intensity =
-            dataChunk.mLaserData[j].mIntensity;
-        }
-      }
-      _dataPacketPublisher.publish(dataPacketMsg);
+    catch (const visensor::exceptions& e) {
+      ROS_ERROR_STREAM(e.what());
+      exit(1);
     }
-    if (_binarySnappyPublisher.getNumSubscribers() > 0) {
-      velodyne::BinarySnappyMsgPtr binarySnappyMsg(
-        new velodyne::BinarySnappyMsg);
-      binarySnappyMsg->header.stamp = timestamp;
-      binarySnappyMsg->header.frame_id = _frameId;
-      binarySnappyMsg->header.seq = _dataPacketCounter++;
-      std::ostringstream binaryStream;
-      dp.writeBinary(binaryStream);
-      std::string binaryStreamSnappy;
-      snappy::Compress(binaryStream.str().data(),
-        binaryStream.str().size(), &binaryStreamSnappy);
-      binarySnappyMsg->data.resize(binaryStreamSnappy.size());
-      std::copy(binaryStreamSnappy.begin(), binaryStreamSnappy.end(),
-        binarySnappyMsg->data.begin());
-      _binarySnappyPublisher.publish(binarySnappyMsg);
-    }
-    _dpFreq->tick();
-  }
+//    list_of_available_sensors_ = drv_.getListOfSensorIDs();
+//    list_of_camera_ids_ = drv_.getListOfCameraIDs();
+//    list_of_dense_ids_ = drv_.getListOfDenseIDs();
+//    list_of_imu_ids_ = drv_.getListOfImuIDs();
+//    list_of_trigger_ids_ = drv_.getListOfTriggerIDs();
 
-  void VISensorNode::publishPositionPacket(const ros::Time& timestamp,
-      const PositionPacket& pp) {
-    if (_imuPublisher.getNumSubscribers() > 0) {
-      sensor_msgs::ImuPtr imuMsg(new sensor_msgs::Imu);
-      imuMsg->header.stamp = timestamp;
-      imuMsg->header.frame_id = _frameId;
-      imuMsg->header.seq = _positionPacketCounter;
-      imuMsg->angular_velocity.x = -pp.getGyro2() * M_PI / 180.0;
-      imuMsg->angular_velocity.y = pp.getGyro1() * M_PI / 180.0;
-      imuMsg->angular_velocity.z = pp.getGyro3() * M_PI / 180.0;
-      imuMsg->linear_acceleration.x = -(pp.getAccel1Y() - pp.getAccel3X()) *
-        GRAV_ACC / 2.0;
-      imuMsg->linear_acceleration.y = -(pp.getAccel2Y() + pp.getAccel3Y()) *
-        GRAV_ACC / 2.0;
-      imuMsg->linear_acceleration.z = (pp.getAccel1X() + pp.getAccel2X()) *
-        GRAV_ACC / 2.0;
-      _imuPublisher.publish(imuMsg);
-    }
-    if (_tempPublisher.getNumSubscribers() > 0) {
-      velodyne::TemperatureMsgPtr tempMsg(new velodyne::TemperatureMsg);
-      tempMsg->header.stamp = timestamp;
-      tempMsg->header.frame_id = _frameId;
-      tempMsg->header.seq = _positionPacketCounter++;
-      tempMsg->temperature = (pp.getTemp1() + pp.getTemp2() + pp.getTemp3())
-        / 3.0;
-      _tempPublisher.publish(tempMsg);
-    }
-    _ppFreq->tick();
-  }
+//    std::string rootdir = ros::package::getPath("visensor_node");
+//    std::string tempCameraInfoFileName;
 
-  bool VISensorNode::setRPM(velodyne::SetRPM::Request& request,
-      velodyne::SetRPM::Response& response) {
-    _spinRate = request.spinRate;
-    if (_spinRate < (int)Controller::mMinRPM) {
-      _spinRate = Controller::mMinRPM;
-      ROS_WARN_STREAM("VISensorNode::VISensorNode(): the RPMs must lie in "
-        "the range [" << Controller::mMinRPM << ", "
-        << Controller::mMaxRPM << "]");
-    }
-    else if (_spinRate > (int)Controller::mMaxRPM) {
-      _spinRate = Controller::mMaxRPM;
-      ROS_WARN_STREAM("VISensorNode::VISensorNode(): the RPMs must lie in "
-        "the range [" << Controller::mMinRPM << ", "
-        << Controller::mMaxRPM << "]");
-    }
-    response.spinRate = _spinRate;
-    if (_serialConnection) {
-      Controller controller(*_serialConnection);
-      try {
-        controller.setRPM(_spinRate);
-        response.response = true;
-        response.message = "Success";
-      }
-      catch (const BadArgumentException<size_t>& e) {
-        ROS_WARN_STREAM("BadArgumentException: " << e.what());
-        response.response = false;
-        response.message = e.what();
-      }
-      catch (const SystemException& e) {
-        ROS_WARN_STREAM("SystemException: " << e.what());
-        response.response = false;
-        response.message = e.what();
-      }
-      catch (const IOException& e) {
-        ROS_WARN_STREAM("IOException: " << e.what());
-        response.message = e.what();
-        response.response = false;
-      }
-      catch (const OutOfBoundException<size_t>& e) {
-        ROS_WARN_STREAM("OutOfBoundException: " << e.what());
-        response.message = e.what();
-        response.response = false;
-      }
-    }
-    else {
-      response.response = false;
-      response.message = "No serial connection";
-    }
-    return true;
-  }
+//    pub_time_host_ = nh_.advertise<visensor_node::visensor_time_host>("time_host", -1);
 
-  void VISensorNode::diagnoseUDPConnectionDP(
-      diagnostic_updater::DiagnosticStatusWrapper& status) {
-    if (_udpConnectionDP && _udpConnectionDP->isOpen()) {
-      status.summaryf(diagnostic_msgs::DiagnosticStatus::OK,
-        "UDP connection opened on %d.",
-        _udpConnectionDP->getPort());
-    }
-    else
-     status.summaryf(diagnostic_msgs::DiagnosticStatus::ERROR,
-      "UDP connection closed on %d.", _devicePortDP);
-  }
+//    try {
+//      drv_.setCameraCallback(boost::bind(&ViSensor::frameCallback, this, _1, _2));
+//      drv_.setDenseMatcherCallback(boost::bind(&ViSensor::denseCallback, this, _1, _2));
+//      drv_.setImuCallback(boost::bind(&ViSensor::imuCallback, this, _1, _2));
+//      drv_.setFramesCornersCallback(boost::bind(&ViSensor::frameCornerCallback, this, _1, _2));
+//      drv_.setExternalTriggerCallback(boost::bind(&ViSensor::triggerCallback, this, _1));
+//      drv_.setCameraCalibrationSlot(0); // 0 is factory calibration
+//    } catch (visensor::exceptions const &ex) {
+//      ROS_WARN("%s", ex.what());
+//    }
 
-  void VISensorNode::diagnoseUDPConnectionPP(
-      diagnostic_updater::DiagnosticStatusWrapper& status) {
-    if (_udpConnectionPP && _udpConnectionPP->isOpen())
-      status.summaryf(diagnostic_msgs::DiagnosticStatus::OK,
-        "UDP connection opened on %d.",
-        _udpConnectionPP->getPort());
-    else
-     status.summaryf(diagnostic_msgs::DiagnosticStatus::ERROR,
-      "UDP connection closed on %d.", _devicePortPP);
-  }
+//    // initialize cameras
+//    for (auto camera_id : list_of_camera_ids_) {
+//      ros::NodeHandle nhc_temp(nh_, ROS_CAMERA_NAMES.at(camera_id));
+//      nhc_.insert(std::pair<SensorId::SensorId, ros::NodeHandle>(camera_id, nhc_temp));
+//      image_transport::ImageTransport itc_temp(nhc_[camera_id]);
+//      itc_.insert(std::pair<SensorId::SensorId, image_transport::ImageTransport>(camera_id, itc_temp));
+//      ROS_INFO("Register publisher for camera %u with topic name %s", camera_id,
+//               ROS_CAMERA_NAMES.at(camera_id).c_str());
+//      image_transport::CameraPublisher image_pub = (itc_.at(camera_id)).advertiseCamera("image_raw", 100);
+//      image_pub_.insert(std::pair<SensorId::SensorId, image_transport::CameraPublisher>(camera_id, image_pub));
 
-  void VISensorNode::diagnoseSerialConnection(
-      diagnostic_updater::DiagnosticStatusWrapper& status) {
-    if (_serialConnection && _serialConnection->isOpen())
-      status.summaryf(diagnostic_msgs::DiagnosticStatus::OK,
-        "Serial connection opened on %s.",
-        _serialConnection->getDevicePathStr().c_str());
-    else
-     status.summaryf(diagnostic_msgs::DiagnosticStatus::WARN,
-      "Serial connection closed on %s.", _serialDeviceStr.c_str());
-  }
+//      precacheViCalibration(camera_id);
 
-  void VISensorNode::diagnoseDataPacketQueue(
-      diagnostic_updater::DiagnosticStatusWrapper& status) {
-    if (_acqThreadDP) {
-      status.add("Size", _acqThreadDP->getBuffer().getSize());
-      status.add("Dropped elements",
-        _acqThreadDP->getBuffer().getNumDroppedElements());
-      status.add("Current points per revolution", _currentPointsPerRevolution);
-      status.add("Target points per revolution", _targetPointsPerRevolution);
-      status.add("Inter packet time [s]", _lastInterDPTime);
-      if (std::fabs(_currentPointsPerRevolution - _targetPointsPerRevolution) >
-          0.2 * _targetPointsPerRevolution)
-        status.summary(diagnostic_msgs::DiagnosticStatus::WARN,
-          "Acquisition thread running (potential data loss)");
-      else
-        status.summary(diagnostic_msgs::DiagnosticStatus::OK,
-          "Acquisition thread running");
-    }
-    else
-      status.summary(diagnostic_msgs::DiagnosticStatus::ERROR,
-        "Acquisition thread not running");
-  }
+//      sensor_msgs::CameraInfo cinfo_temp;
+//      if (getRosCameraConfig(camera_id, cinfo_temp))
+//        ROS_INFO_STREAM("Read calibration for "<< ROS_CAMERA_NAMES.at(camera_id));
+//      else
+//        ROS_INFO_STREAM("Could not read calibration for "<< ROS_CAMERA_NAMES.at(camera_id));
 
-  void VISensorNode::diagnosePositionPacketQueue(
-      diagnostic_updater::DiagnosticStatusWrapper& status) {
-    if (_acqThreadPP) {
-      status.add("Size", _acqThreadPP->getBuffer().getSize());
-      status.add("Dropped elements",
-        _acqThreadPP->getBuffer().getNumDroppedElements());
-      status.add("Inter packet time [s]", _lastInterPPTime);
-      status.summary(diagnostic_msgs::DiagnosticStatus::OK,
-        "Acquisition thread running");
-    }
-    else
-      status.summary(diagnostic_msgs::DiagnosticStatus::ERROR,
-        "Acquisition thread not running");
+//      cinfo_.insert(std::pair<SensorId::SensorId, sensor_msgs::CameraInfo>(camera_id, cinfo_temp));
+
+//      ros::Publisher temp_pub;
+//      temp_pub = nhc_temp.advertise<visensor_node::visensor_calibration>("calibration", -1);
+//      calibration_pub_.insert(std::pair<visensor::SensorId::SensorId, ros::Publisher>(camera_id, temp_pub));
+//    }
+
+//    //Generate Stereo ROS config, assuming than cam0 and cam1 are in fronto-parallel stereo configuration
+//    if (getRosStereoCameraConfig(SensorId::CAM0, cinfo_.at(SensorId::CAM0),
+//                                 SensorId::CAM1, cinfo_.at(SensorId::CAM1)))
+//      ROS_INFO("Generated ROS Stereo Calibration, assuming cam0 and cam1 are a stereo pair.");
+//    else
+//      ROS_INFO("Could not read stereo calibration for cam0 and cam1.");
+
+//    // initialize dense cameras
+//    for (auto dense_id : list_of_dense_ids_) {
+//      ros::NodeHandle nhc_temp(nh_, "dense");
+//      nhc_.insert(std::pair<SensorId::SensorId, ros::NodeHandle>(dense_id, nhc_temp));
+//      image_transport::ImageTransport itc_temp(nhc_[dense_id]);
+//      itc_.insert(std::pair<SensorId::SensorId, image_transport::ImageTransport>(dense_id, itc_temp));
+//      ROS_INFO_STREAM("Register publisher for dense " << dense_id);
+//      image_transport::CameraPublisher image_pub = (itc_.at(dense_id)).advertiseCamera("image_raw", 100);
+//      image_pub_.insert(std::pair<SensorId::SensorId, image_transport::CameraPublisher>(dense_id, image_pub));
+
+//      //sensor_msgs::CameraInfo cinfo_temp;
+//      //if (getRosCameraConfig(dense_id, cinfo_temp))
+//      //  ROS_INFO_STREAM("Read calibration for "<< dense_id);
+//      //else
+//      //  ROS_INFO_STREAM("Could not read calibration for "<< dense_id);
+
+//      //TODO(omaris) Adapt camera info messages accordingly
+//      //cinfo_.insert(std::pair<SensorId::SensorId, sensor_msgs::CameraInfo>(dense_id, cinfo_temp));
+//    }
+
+//    // Initialize imus
+//    for (auto imu_id : list_of_imu_ids_) {
+//      ros::Publisher temp_pub;
+//      temp_pub = nh_.advertise<sensor_msgs::Imu>(ROS_IMU_NAMES.at(imu_id), -1);
+//      printf("register publisher for imu %u\n", imu_id);
+//      imu_pub_.insert(std::pair<visensor::SensorId::SensorId, ros::Publisher>(imu_id, temp_pub));
+//      temp_pub = nh_.advertise<visensor_node::visensor_imu>("cust_" + ROS_IMU_NAMES.at(imu_id), -1);
+//      imu_custom_pub_.insert(std::pair<visensor::SensorId::SensorId, ros::Publisher>(imu_id, temp_pub));
+//    }
+
+//    trigger_pub_ = nh_.advertise<visensor_node::visensor_trigger>("external_trigger", -1);
+//    calibration_service_ = nh_.advertiseService("get_camera_calibration", &ViSensor::calibrationServiceCallback, this);
+
+//    // init dynamic reconfigure
+//    dr_srv_.setCallback(boost::bind(&ViSensor::configCallback, this, _1, _2));
   }
 
   void VISensorNode::spin() {
-    std::ifstream calibFile(_calibFileName);
-    _calibration.reset(new Calibration());
-    try {
-      calibFile >> *_calibration;
-    }
-    catch (const IOException& e) {
-      ROS_WARN_STREAM("IOException: " << e.what());
-    }
-    if (_deviceName == "Velodyne HDL-64E S2") {
-      _serialConnection.reset(new SerialConnection(_serialDeviceStr,
-        _serialBaudrate));
-      Controller controller(*_serialConnection);
-      try {
-        controller.setRPM(_spinRate);
-      }
-      catch (const BadArgumentException<size_t>& e) {
-        ROS_WARN_STREAM("BadArgumentException: " << e.what());
-      }
-      catch (const SystemException& e) {
-        ROS_WARN_STREAM("SystemException: " << e.what());
-      }
-      catch (const IOException& e) {
-        ROS_WARN_STREAM("IOException: " << e.what());
-      }
-      catch (const OutOfBoundException<size_t>& e) {
-        ROS_WARN_STREAM("OutOfBoundException: " << e.what());
-      }
-    }
-    _udpConnectionDP.reset(new UDPConnectionServer(_devicePortDP));
-    _acqThreadDP.reset(new AcquisitionThread<DataPacket>(*_udpConnectionDP));
-    _acqThreadDP->getBuffer().setCapacity(_bufferCapacity);
-    _acqThreadDP->start();
-    if (_deviceName == "Velodyne HDL-32E") {
-      _udpConnectionPP.reset(new UDPConnectionServer(_devicePortPP));
-      _acqThreadPP.reset(new AcquisitionThread<PositionPacket>(
-        *_udpConnectionPP));
-      _acqThreadPP->getBuffer().setCapacity(_bufferCapacity);
-      _acqThreadPP->start();
-    }
-    Timer timer;
-    ros::Rate loopRate(_acquisitionLoopRate);
-    while (_nodeHandle.ok()) {
-      try {
-        if (!_acqThreadDP->getBuffer().isEmpty()) {
-          std::shared_ptr<DataPacket> dp(_acqThreadDP->getBuffer().dequeue());
-          const double startAngle = Calibration::deg2rad(
-            dp->getDataChunk(0).mRotationalInfo /
-            (double)DataPacket::mRotationResolution);
-          const double endAngle = Calibration::deg2rad(
-            dp->getDataChunk(DataPacket::mDataChunkNbr - 1).mRotationalInfo /
-            (double)DataPacket::mRotationResolution);
-          if ((_lastStartAngle > endAngle || startAngle > endAngle) &&
-              _revolutionPacketCounter) {
-            _currentPointsPerRevolution = _revolutionPacketCounter * 384;
-            _revolutionPacketCounter = 0;
-          }
-          else {
-            _revolutionPacketCounter++;
-          }
-          _lastStartAngle = startAngle;
-          const double timestamp = dp->getTimestamp();
-          if (_lastDPTimestamp)
-            _lastInterDPTime = timestamp - _lastDPTimestamp;
-          _lastDPTimestamp = timestamp;
-          publishDataPacket(ros::Time(timestamp), *dp);
-        }
-        if (_deviceName == "Velodyne HDL-32E" &&
-            !_acqThreadPP->getBuffer().isEmpty()) {
-          std::shared_ptr<PositionPacket> pp(
-            _acqThreadPP->getBuffer().dequeue());
-          const double timestamp = pp->getTimestamp();
-          if (_lastPPTimestamp)
-            _lastInterPPTime = timestamp - _lastPPTimestamp;
-          _lastPPTimestamp = timestamp;
-          publishPositionPacket(ros::Time(timestamp), *pp);
-        }
-      }
-      catch (const IOException& e) {
-        ROS_WARN_STREAM("IOException: " << e.what());
-        ROS_WARN_STREAM("Retrying in " << _retryTimeout << " [s]");
-        timer.sleep(_retryTimeout);
-      }
-      catch (const SystemException& e) {
-        ROS_WARN_STREAM("SystemException: " << e.what());
-        ROS_WARN_STREAM("Retrying in " << _retryTimeout << " [s]");
-        timer.sleep(_retryTimeout);
-      }
-      catch (const InvalidOperationException& e) {
-        ROS_WARN_STREAM("InvalidOperationException: " << e.what());
-        ROS_WARN_STREAM("Retrying in " << _retryTimeout << " [s]");
-        timer.sleep(_retryTimeout);
-      }
-      _updater.update();
-      ros::spinOnce();
-      loopRate.sleep();
-    }
+    init();
+    ros::spin();
   }
 
   void VISensorNode::getParameters() {
-    _nodeHandle.param<std::string>("sensor/device_name", _deviceName,
-      "Velodyne HDL-64E S2");
-    _nodeHandle.param<std::string>("ros/frame_id", _frameId,
-      "/velodyne_link");
+    _nodeHandle.param<std::string>("ros/frame_id", _frameId, "/visensor_link");
     _nodeHandle.param<int>("ros/queue_depth", _queueDepth, 100);
-    if (_deviceName == "Velodyne HDL-64E S2")
-      _nodeHandle.param<double>("ros/acquisition_loop_rate",
-        _acquisitionLoopRate, 4166.6);
-    else if (_deviceName == "Velodyne HDL-32E")
-      _nodeHandle.param<double>("ros/acquisition_loop_rate",
-        _acquisitionLoopRate, 2083.30);
-    _nodeHandle.param<int>("udp_connection/device_port_dp", _devicePortDP,
-      2368);
-    _nodeHandle.param<int>("udp_connection/device_port_pp", _devicePortPP,
-      8308);
-    _nodeHandle.param<std::string>("serial_connection/serial_device",
-      _serialDeviceStr, "/dev/janeth/velodyne");
-    _nodeHandle.param<int>("serial_connection/baud_rate", _serialBaudrate,
-      115200);
     _nodeHandle.param<double>("connection/retry_timeout", _retryTimeout, 1);
-    if (_deviceName == "Velodyne HDL-64E S2") {
-      // we should have 3472.166666667 packets per second +- 20%
-      _nodeHandle.param<double>("diagnostics/dp_min_freq", _dpMinFreq, 2777.73);
-      _nodeHandle.param<double>("diagnostics/dp_max_freq", _dpMaxFreq, 4166.6);
-    }
-    else {
-      // we should have 1736.083333333 packets per second +- 20%
-      _nodeHandle.param<double>("diagnostics/dp_min_freq", _dpMinFreq, 1388.87);
-      _nodeHandle.param<double>("diagnostics/dp_max_freq", _dpMaxFreq, 2083.30);
-    }
-    // we should have 200Hz +- 20%
-    _nodeHandle.param<double>("diagnostics/pp_min_freq", _ppMinFreq, 160);
-    _nodeHandle.param<double>("diagnostics/pp_max_freq", _ppMaxFreq, 240);
-    _nodeHandle.param<int>("sensor/buffer_capacity", _bufferCapacity, 100000);
-    _nodeHandle.param<double>("sensor/min_distance", _minDistance, 0.9);
-    _nodeHandle.param<double>("sensor/max_distance", _maxDistance, 120);
-    if (_deviceName == "Velodyne HDL-64E S2")
-      _nodeHandle.param<std::string>("sensor/calibration_file", _calibFileName,
-        "conf/calib-HDL-64E.dat");
-    else if (_deviceName == "Velodyne HDL-32E")
-      _nodeHandle.param<std::string>("sensor/calibration_file", _calibFileName,
-        "conf/calib-HDL-32E.dat");
-    else
-      ROS_ERROR_STREAM("Unknown device: " << _deviceName);
-    _nodeHandle.param<int>("sensor/spin_rate", _spinRate, 300);
-    if (_deviceName == "Velodyne HDL-64E S2")
-      // from the datasheet
-      _targetPointsPerRevolution = 20833.0 * 64.0 / (_spinRate / 60.0);
-    else
-      // from the datasheet
-      _targetPointsPerRevolution = 20833.0 * 32.0 / 10.0;
+    _nodeHandle.param<double>("diagnostics/dp_min_freq", _dpMinFreq, 2777.73);
+    _nodeHandle.param<double>("diagnostics/dp_max_freq", _dpMaxFreq, 4166.6);
+    _nodeHandle.param<std::string>("sensor/device_name", _deviceName,
+      "VI-sensor");
   }
 
 }

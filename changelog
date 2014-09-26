@@ -1,3 +1,9 @@
+visensor-ros (0.1-2) precise; urgency=low
+
+  * Rough edits 
+
+ -- Jerome Maye <jerome.maye@mavt.ethz.ch>  Fri, 26 Sep 2014 13:44:35 +0200
+
 visensor-ros (0.1-1) precise; urgency=low
 
   * First commit.
