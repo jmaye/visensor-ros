@@ -1,0 +1,5 @@
+<launch>
+  <node name="visensor" pkg="visensor" type="visensor_node" output="screen" respawn="true">
+    <rosparam command="load" file="$(find visensor)/etc/visensor.yaml"/>
+  </node>
+</launch>
