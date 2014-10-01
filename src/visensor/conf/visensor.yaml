@@ -3,8 +3,8 @@ connection:
 sensor:
   device_name: "VI-sensor"
 diagnostics:
-  dp_min_freq: 2777.73
-  dp_max_freq: 4166.6
+  imu_min_freq: 320.0
+  imu_max_freq: 480.0
 ros:
   queue_depth: 100
   frame_id: "/visensor_link"

@@ -26,17 +26,25 @@
 
 #include <string>
 #include <memory>
+#include <vector>
+#include <cstdint>
+#include <map>
 
 #include <ros/ros.h>
+
 #include <diagnostic_updater/diagnostic_updater.h>
+
+#include <image_transport/image_transport.h>
+
+#include <boost/shared_ptr.hpp>
+
+#include <visensor/visensor.hpp>
 
 namespace diagnostic_updater {
   class HeaderlessTopicDiagnostic;
 }
 
 namespace visensor {
-
-  class ViSensorDriver;
 
   /** The class VISensorNode implements the Vi-sensor node.
       \brief VI-sensor node
@@ -76,7 +84,19 @@ namespace visensor {
     /// Retrieves parameters
     void getParameters();
     /// Init the VI-sensor
-    void init();
+    bool init();
+    /// Clear stored sensor information
+    void cleanup();
+    /// IMU callback
+    void imuCallback(boost::shared_ptr<ViImuMsg> imuMsg, ViErrorCode errorCode);
+    /// Frame callback
+    void frameCallback(ViFrame::Ptr frame, ViErrorCode errorCode);
+    /// Dense callback
+    void denseCallback(ViFrame::Ptr frame, ViErrorCode errorCode);
+    /// Frame corner callback
+    void frameCornerCallback(ViFrame::Ptr frame, ViCorner::Ptr corners);
+    /// Trigger callback
+    void triggerCallback(ViExternalTriggerMsg::Ptr trigger);
     /** @}
       */
 
@@ -93,18 +113,61 @@ namespace visensor {
     double _retryTimeout;
     /// Diagnostic updater
     diagnostic_updater::Updater _updater;
-    /// Frequency diagnostic for data packet
-    std::shared_ptr<diagnostic_updater::HeaderlessTopicDiagnostic> _dpFreq;
-    /// Data packet minimum frequency
-    double _dpMinFreq;
-    /// Data packet maximum frequency
-    double _dpMaxFreq;
     /// Queue depth
     int _queueDepth;
-    /// Data packet counter
-    long _dataPacketCounter;
     /// Handle on the VI-sensor low-level driver
     std::shared_ptr<ViSensorDriver> _driver;
+    /// Connected VI-sensors IPs
+    ViDeviceList _hostnames;
+    /// Sensor Ids
+    std::vector<SensorId::SensorId> _sensorIds;
+    /// Camera Ids
+    std::vector<SensorId::SensorId> _cameraIds;
+    /// Dense Ids
+    std::vector<SensorId::SensorId> _denseIds;
+    /// IMU Ids
+    std::vector<SensorId::SensorId> _imuIds;
+    /// Trigger Ids
+    std::vector<SensorId::SensorId> _triggerIds;
+    /// FPGA Id
+    uint32_t _fpgaId;
+    /// SensorId map to string
+    static std::map<SensorId::SensorId, std::string> _sensorIdsMap;
+    /// IMU publishers
+    std::map<SensorId::SensorId, ros::Publisher> _imuPublishers;
+    /// Frequency diagnostic for IMUs
+    std::map<SensorId::SensorId,
+      std::shared_ptr<diagnostic_updater::HeaderlessTopicDiagnostic> >_imuFreqs;
+    /// IMU packet minimum frequency percentage
+    double _imuMinFreqPercentage;
+    /// IMU packet minimum frequency
+    double _imuMinFreq;
+    /// IMU packet maximum frequency percentage
+    double _imuMaxFreqPercentage;
+    /// IMU packet maximum frequency
+    double _imuMaxFreq;
+    /// IMU frequency
+    int _imuFrequency;
+    /// Camera image transports
+    std::map<SensorId::SensorId, image_transport::ImageTransport>
+      _cameraImageTransports;
+    /// Camera publishers
+    std::map<SensorId::SensorId, image_transport::CameraPublisher>
+      _cameraPublishers;
+    /// Frequency diagnostic for cameras
+    std::map<SensorId::SensorId,
+      std::shared_ptr<diagnostic_updater::HeaderlessTopicDiagnostic> >
+      _cameraFreqs;
+    /// Camera packet minimum frequency percentage
+    double _cameraMinFreqPercentage;
+    /// Camera packet minimum frequency
+    double _cameraMinFreq;
+    /// Camera packet maximum frequency percentage
+    double _cameraMaxFreqPercentage;
+    /// Camera packet maximum frequency
+    double _cameraMaxFreq;
+    /// Camera frequency
+    int _cameraFrequency;
     /** @}
       */
 
