@@ -31,6 +31,7 @@
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/CameraInfo.h>
 #include <sensor_msgs/image_encodings.h>
+#include <sensor_msgs/fill_image.h>
 
 namespace visensor {
 
@@ -80,6 +81,7 @@ std::map<SensorId::SensorId, std::string> VISensorNode::_sensorIdsMap = {
       _cameraFrequency;
     _driver = std::make_shared<ViSensorDriver>();
     _updater.setHardwareID(_deviceName);
+    _updater.add("Connection", this, &VISensorNode::diagnoseConnection);
     _updater.force_update();
   }
 
@@ -89,6 +91,27 @@ std::map<SensorId::SensorId, std::string> VISensorNode::_sensorIdsMap = {
 /******************************************************************************/
 /* Methods                                                                    */
 /******************************************************************************/
+
+  void VISensorNode::diagnoseConnection(
+      diagnostic_updater::DiagnosticStatusWrapper& status) {
+    if (_hostnames.empty())
+     status.summaryf(diagnostic_msgs::DiagnosticStatus::ERROR,
+      "No device connected");
+    else {
+      status.add("Host IP", _hostnames.front());
+      std::stringstream sensorIdsStream;
+      for (auto it = _sensorIds.cbegin(); it != _sensorIds.cend(); ++it)
+        sensorIdsStream << _sensorIdsMap.at(*it) << " ";
+      status.add("Sensors", sensorIdsStream.str());
+      status.add("FPGA ID", _fpgaId);
+      std::stringstream apiVersionStream;
+      apiVersionStream << LIBRARY_VERSION_MAJOR << "."
+        << LIBRARY_VERSION_MINOR << "." << LIBRARY_VERSION_PATCH;
+      status.add("API version", apiVersionStream.str());
+      status.summaryf(diagnostic_msgs::DiagnosticStatus::OK,
+        "%s connected", _deviceName.c_str());
+    }
+  }
 
   void VISensorNode::imuCallback(boost::shared_ptr<ViImuMsg> imuMsg, ViErrorCode
       errorCode) {
@@ -156,24 +179,31 @@ std::map<SensorId::SensorId, std::string> VISensorNode::_sensorIdsMap = {
         << _sensorIdsMap.at(static_cast<SensorId::SensorId>(frame->camera_id)));
       return;
     }
+    const double frameDelay = (ros::Time::now() -
+      ros::Time().fromNSec(frame->timestamp)).toSec();
+    if (frameDelay > _maxTransmissionDelay)
+      ROS_WARN_STREAM("VISensorNode::frameCallback(): "
+        << _sensorIdsMap.at(static_cast<SensorId::SensorId>(frame->camera_id))
+        << ": Transmission delay exceeded: " << frameDelay * 1000.0 << "[ms]");
     if (_cameraPublishers.at(static_cast<SensorId::SensorId>(frame->camera_id)).
         getNumSubscribers() > 0) {
       auto imgMsg = boost::make_shared<sensor_msgs::Image>();
+      imgMsg->header.stamp = ros::Time().fromNSec(frame->timestamp);
+      imgMsg->header.frame_id =
+        _sensorIdsMap.at(static_cast<SensorId::SensorId>(frame->camera_id)) +
+        "_link";
       if (frame->image_type == MONO8)
-        sensor_msgs::fillImage(imgMsg, sensor_msgs::image_encodings::MONO8,
+        sensor_msgs::fillImage(*imgMsg, sensor_msgs::image_encodings::MONO8,
           frame->height, frame->width, frame->width, frame->getImageRawPtr());
-      else if (frame->image_type == MONO16) {
-        cv::Mat image;
-        image.create(frame->height, frame->width, CV_16UC1);
-        cv::Mat image_8bit;
-        image_8bit.create(frame->height, frame->width, CV_8UC1);
-        memcpy(image.data, frame->getImageRawPtr(), frame->width * frame->height * 2);
-        sensor_msgs::fillImage(imgMsg, sensor_msgs::image_encodings::MONO16,
-          frame->height, frame->width, frame->width * 2, image.data);
-      }
       else
         ROS_WARN_STREAM("VISensorNode::frameCallback(): Unknown image type");
       auto ciMsg = boost::make_shared<sensor_msgs::CameraInfo>();
+      ciMsg->header.frame_id =
+        _sensorIdsMap.at(static_cast<SensorId::SensorId>(frame->camera_id)) +
+        "_link";
+      ciMsg->header.stamp = ros::Time().fromNSec(frame->timestamp);
+      ciMsg->height = frame->height;
+      ciMsg->width = frame->width;
       _cameraPublishers.at(
         static_cast<SensorId::SensorId>(frame->camera_id)).publish(imgMsg,
         ciMsg);
@@ -270,6 +300,12 @@ std::map<SensorId::SensorId, std::string> VISensorNode::_sensorIdsMap = {
     }
     _driver->startAllImus(_imuFrequency);
     _driver->startAllCameras(_cameraFrequency);
+    _driver->startAllExternalTriggers(_triggerFrequency);
+    _driver->startAllCorners();
+    _driver->startAllDenseMatchers();
+    if (std::count(_sensorIds.cbegin(), _sensorIds.cend(),
+        visensor::SensorId::LED_FLASHER0) > 0)
+      _driver->startSensor(visensor::SensorId::LED_FLASHER0);
     return true;
   }
 
@@ -306,6 +342,10 @@ std::map<SensorId::SensorId, std::string> VISensorNode::_sensorIdsMap = {
       IMU_FREQUENCY);
     _nodeHandle.param<int>("sensor/camera_frequency", _cameraFrequency,
       CAMERA_FREQUENCY);
+    _nodeHandle.param<int>("sensor/trigger_frequency", _triggerFrequency,
+      IMU_FREQUENCY);
+    _nodeHandle.param<double>("sensor/max_transmission_delay",
+      _maxTransmissionDelay, 0.1);
   }
 
 }

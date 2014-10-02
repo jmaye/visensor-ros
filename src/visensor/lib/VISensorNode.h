@@ -97,6 +97,9 @@ namespace visensor {
     void frameCornerCallback(ViFrame::Ptr frame, ViCorner::Ptr corners);
     /// Trigger callback
     void triggerCallback(ViExternalTriggerMsg::Ptr trigger);
+    /// Diagnose the connection
+    void diagnoseConnection(diagnostic_updater::DiagnosticStatusWrapper&
+      status);
     /** @}
       */
 
@@ -168,6 +171,10 @@ namespace visensor {
     double _cameraMaxFreq;
     /// Camera frequency
     int _cameraFrequency;
+    /// Maximum transmission delay [s]
+    double _maxTransmissionDelay;
+    /// Trigger frequency
+    int _triggerFrequency;
     /** @}
       */
 

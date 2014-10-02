@@ -2,9 +2,15 @@ connection:
   retry_timeout: 1.0
 sensor:
   device_name: "VI-sensor"
+  imu_frequency: 100
+  camera_frequency: 20
+  trigger_frequency: 100
+  max_transmission_delay: 0.1
 diagnostics:
-  imu_min_freq: 320.0
-  imu_max_freq: 480.0
+  imu_min_freq_percentage: 0.2
+  imu_max_freq_percentage: 0.2
+  camera_min_freq_percentage: 0.2
+  camera_max_freq_percentage: 0.2
 ros:
   queue_depth: 100
   frame_id: "/visensor_link"
